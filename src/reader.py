@@ -11,6 +11,9 @@ log.basicConfig(stream=sys.stderr, level=log.INFO)
 PAD = '<PAD>'
 UNK = '<UNK>'
 EOS = '<EOS>'
+PAD_ID = 0
+UNK_ID = 1
+EOS_ID = 2
 
 def read_data(filename):
   '''
@@ -67,9 +70,9 @@ def build_vocab(lines, max_vocab_size):
   counts_sorted = sorted(counts.items(), key=lambda e: e[1], reverse=True)
 
   tok_id = OrderedDict()
-  tok_id[PAD] = 0
-  tok_id[UNK] = 1
-  tok_id[EOS] = 2
+  tok_id[PAD] = PAD_ID
+  tok_id[UNK] = UNK_ID
+  tok_id[EOS] = EOS_ID
 
   offset = len(tok_id)
 
