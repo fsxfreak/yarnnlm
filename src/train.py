@@ -1,5 +1,5 @@
 import logging as log
-import os, sys 
+import os, sys, time
 
 import tensorflow as tf
 import numpy as np
@@ -7,19 +7,22 @@ import numpy as np
 import reader
 
 flags = tf.app.flags
-flags.DEFINE_float('learning_rate', 0.0001, 'Initial learning rate.')
+flags.DEFINE_float('learning_rate', 0.1, 'Initial learning rate.')
 flags.DEFINE_integer('max_epochs', 10, 'Maximum number of epochs.')
 flags.DEFINE_integer('hidden_dim', 128, 'RNN hidden state size.')
 flags.DEFINE_integer('max_time_steps', 20, 'Truncated backprop length.')
 
 flags.DEFINE_integer('vocab_size', 30000, 'Vocabulary size.')
 flags.DEFINE_string('vocab_data', 'vocab.pkl', 'Vocabulary file.')
-flags.DEFINE_string('train_data', 'train.txt', 'Training data.')
+flags.DEFINE_string('train_data', 'train.shuf.txt', 'Training data.')
 flags.DEFINE_string('dev_data', 'dev.txt', 'Validation data.')
 
 flags.DEFINE_string('checkpoint_prefix', 
   '/nfs/topaz/lcheung/models/tf-test/model',
   'Prefix of checkpoint files.')
+flags.DEFINE_string('run_name', 
+  'dyn_rnn',
+  'Run name in tensorboard.')
 
 flags.DEFINE_string('output_mode', 'debug', 'verbose | debug | info')
 flags.DEFINE_string('tf_log_dir', '/nfs/topaz/lcheung/tensorboard',
@@ -49,6 +52,8 @@ class RNN(object):
       self.embedded_input = tf.nn.embedding_lookup(
           self.embedding, self.data_input, name='x_m') 
     with tf.variable_scope('RNN'):
+      # need to keep the embedded input, then feed those in as inputs
+      # into the tf nn dynamic rnn cell
       self.initial_hidden_state = tf.get_variable(
           'h_init', [ 1, FLAGS.hidden_dim ], dtype=tf.float32, trainable=False,
           initializer=tf.zeros_initializer())
@@ -65,6 +70,7 @@ class RNN(object):
     self.build_optimizer()
 
   def build_recurrence(self, h_prev, x_m):
+    # expand_dims used to convert 1d array to 1d vector
     return tf.tanh(tf.matmul(tf.expand_dims(x_m, 0), self.input_entry)
                  + tf.matmul(h_prev, self.recurrence)
                  + self.recurrence_bias)
@@ -107,8 +113,10 @@ class RNN(object):
     '''
     with tf.variable_scope('Optimizer'):
       #tf.train.optimizer.minimize(self.loss, name='optimizer')
-      self.optimizer = tf.train.AdamOptimizer(learning_rate=FLAGS.learning_rate)
+      self.optimizer = tf.train.GradientDescentOptimizer(FLAGS.learning_rate)
       self.minimizer = self.optimizer.minimize(self.loss, name='minimizer')
+
+      tf.summary.scalar("learning_rate", self.optimizer._learning_rate)
 
   def _load_or_create(self, sess):
     ckpt = tf.train.get_checkpoint_state(os.path.dirname(FLAGS.checkpoint_prefix))
@@ -129,7 +137,9 @@ class RNN(object):
                     gpu_options=tf.GPUOptions(allow_growth=True))) as sess:
       self._load_or_create(sess)
 
-      file_writer = tf.summary.FileWriter(FLAGS.tf_log_dir, sess.graph)
+      file_writer = tf.summary.FileWriter(
+          os.path.join(FLAGS.tf_log_dir, FLAGS.run_name),
+          sess.graph)
       summaries = tf.summary.merge_all()
 
       window = FLAGS.max_time_steps
@@ -147,7 +157,8 @@ class RNN(object):
           target = np.pad(target, (0, window - len(target)), (0, reader.PAD_ID))
 
         _, loss, summary_output, out = sess.run(
-            [ self.minimizer, self.loss, summaries, self.predicted_tokens ],
+            [ self.minimizer, self.loss, summaries,
+              self.predicted_tokens ],
             feed_dict={
               self.data_input : source,
               self.data_target: target
