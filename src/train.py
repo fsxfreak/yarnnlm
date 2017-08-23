@@ -8,10 +8,12 @@ import reader
 
 flags = tf.app.flags
 flags.DEFINE_float('learning_rate', 0.1, 'Initial learning rate.')
-flags.DEFINE_integer('max_epochs', 10, 'Maximum number of epochs.')
+flags.DEFINE_float('prob_dropout', 0.2, 'Dropout probability.')
+flags.DEFINE_integer('max_epochs', 500, 'Maximum number of epochs.')
 flags.DEFINE_integer('hidden_dim', 128, 'RNN hidden state size.')
 flags.DEFINE_integer('max_time_steps', 20, 'Truncated backprop length.')
-flags.DEFINE_integer('batch_size', 40, 'Num examples per minibatch.')
+flags.DEFINE_integer('batch_size', 128, 'Num examples per minibatch.')
+flags.DEFINE_integer('hidden_layers', 2, 'Num of RNN layers.')
 
 flags.DEFINE_integer('vocab_size', 30000, 'Vocabulary size.')
 flags.DEFINE_string('vocab_data', 'vocab.pkl', 'Vocabulary file.')
@@ -33,8 +35,8 @@ FLAGS = flags.FLAGS
 
 log.basicConfig(stream=sys.stderr, level=log.INFO)
 
-def convert_id_tok(samples, id_tok):
-  s_raw = [ id_tok[sample] for sample in samples ]
+def convert_id_tok(batches, id_tok):
+  s_raw = [ id_tok[sample] for batch in batches for sample in batch ]
   return ' '.join(s_raw)
 
 class RNNLM(object):
@@ -50,19 +52,21 @@ class RNNLM(object):
           'W_xm', [ FLAGS.vocab_size, FLAGS.hidden_dim ], dtype=tf.float32)
       self.embedded_input = tf.nn.embedding_lookup(
           self.embedding, self.data_input, name='x_m') 
+      log.debug('Embedded input shape: %s' % self.embedded_input.shape)
     with tf.variable_scope('RNN'):
       # need to keep the embedded input, then feed those in as inputs
       # into the tf nn dynamic rnn cell
-      self.initial_hidden_state = tf.get_variable(
-          'h_init', [ 1, FLAGS.hidden_dim ], dtype=tf.float32, trainable=False,
-          initializer=tf.zeros_initializer())
-      self.input_entry = tf.get_variable(
-          'W_mh', [ FLAGS.hidden_dim, FLAGS.hidden_dim ], dtype=tf.float32)
-      self.recurrence = tf.get_variable(
-          'W_hh', [ FLAGS.hidden_dim, FLAGS.hidden_dim ], dtype=tf.float32)
-      self.recurrence_bias = tf.get_variable(
-          'b_h', [ 1, FLAGS.hidden_dim ], dtype=tf.float32)
+      cell = tf.nn.rnn_cell.LSTMCell(FLAGS.hidden_dim)
+      cell = tf.nn.rnn_cell.DropoutWrapper(cell,
+          output_keep_prob=(1.0 - FLAGS.prob_dropout))
+      rnn_layers = tf.nn.rnn_cell.MultiRNNCell([ cell ] * FLAGS.hidden_layers)
 
+      self.initial_hidden_state = rnn_layers.zero_state(
+          FLAGS.batch_size, dtype=tf.float32)
+      self.hidden_outputs, self.next_state = tf.nn.dynamic_rnn(
+          rnn_layers, self.embedded_input, 
+          initial_state=self.initial_hidden_state)
+      log.debug('hidden output shape: %s' % self.hidden_outputs.shape)
 
     self.build_inference()
     self.build_loss()
@@ -103,37 +107,48 @@ class RNNLM(object):
       self.data_input.set_shape([ FLAGS.batch_size, FLAGS.max_time_steps ])
       self.data_target.set_shape([ FLAGS.batch_size, FLAGS.max_time_steps ])
 
-  def build_recurrence(self, h_prev, x_m):
-    # expand_dims used to convert 1d array to 1d vector
-    return tf.tanh(tf.matmul(tf.expand_dims(x_m, 0), self.input_entry)
-                 + tf.matmul(h_prev, self.recurrence)
-                 + self.recurrence_bias)
-
   def build_inference(self):
     with tf.variable_scope('Inference'):
-      self.hidden_output = tf.scan(self.build_recurrence, self.embedded_input, 
-          initializer=self.initial_hidden_state)
+      # combine steps from all batches into one
+      self.outputs_squashed = tf.reshape(self.hidden_outputs,
+          [-1, FLAGS.hidden_dim], name='squashed_h_out')
+      log.debug('shape of outputs squashed: %s' % self.outputs_squashed.shape)
 
       self.output_exit = tf.get_variable(
           'W_hx', [ FLAGS.hidden_dim, FLAGS.vocab_size ], dtype=tf.float32)
       self.output_exit_bias = tf.get_variable(
           'b_x', [ 1, FLAGS.vocab_size ], dtype=tf.float32)
-    
-      self.outputs_squashed = tf.reshape(self.hidden_output, [-1, FLAGS.hidden_dim])
+   
       self.logits = tf.matmul(self.outputs_squashed, self.output_exit) \
                   + self.output_exit_bias 
-      self.token_probs = tf.nn.softmax(self.logits, name='p_ts')
+      self.logits = tf.reshape(self.logits, 
+          [ FLAGS.batch_size, FLAGS.max_time_steps, FLAGS.vocab_size ])
+      log.debug('shape of logits: %s' % self.logits.shape)
 
-      self.predicted_tokens = tf.argmax(self.token_probs, axis=1,
+      self.token_probs = tf.nn.softmax(self.logits, name='p_ts')
+      log.debug('shape of token probs: %s' % self.token_probs.shape)
+      self.predicted_tokens = tf.argmax(self.token_probs, axis=2,
           name='predicteds')
+      log.debug('shape of predicted tokens: %s' % self.predicted_tokens.shape)
 
   def build_loss(self):
     with tf.variable_scope('Loss'):
+      log.debug('shape of targets: %s' % self.data_target.shape)
+      '''
       self.losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
           name='losses',
           labels=self.data_target,
           logits=self.logits)
       self.loss = tf.reduce_mean(self.losses, name='loss')
+      '''
+      self.loss = tf.reduce_sum(tf.contrib.seq2seq.sequence_loss(
+          self.logits,
+          self.data_target,
+          tf.ones([ FLAGS.batch_size, FLAGS.max_time_steps], dtype=tf.float32),
+          average_across_timesteps=False,
+          average_across_batch=True,
+          name='loss'))
+
       tf.summary.scalar("loss_smy", self.loss)
       log.debug('Loss shape; %s' % self.loss.shape)
 
@@ -161,7 +176,8 @@ class RNNLM(object):
       self.saver.save(sess, FLAGS.checkpoint_prefix, global_step=0)
       log.debug('Initialized new model.')
 
-    threads = tf.train.start_queue_runners(sess=sess)
+    self.coord = tf.train.Coordinator()
+    self.threads = tf.train.start_queue_runners(sess=sess, coord=self.coord)
 
   def train(self):
     verbose = FLAGS.output_mode == 'verbose'
@@ -181,32 +197,33 @@ class RNNLM(object):
       data_len = len(self.train_data)
       num_steps = ((data_len // FLAGS.batch_size) - 1) // FLAGS.max_time_steps
 
+      global_step = 0
+      cum_loss = 0.0
       for epoch in range(FLAGS.max_epochs):
-        cum_loss = 0.0
         for step in range(num_steps):
-          if len(source) < window:
-            source = np.pad(source, (0, window - len(source)), 
-                mode='constant', constant_values=(0, reader.PAD_ID))
-          if len(target) < window:
-            target = np.pad(target, (0, window - len(target)), 
-                mode='constant', constant_values=(0, reader.PAD_ID))
-
-          _, loss, summary_output, out = sess.run(
+          _, loss, summary_output, target, out = sess.run(
               [ self.minimizer, self.loss, summaries,
+                self.data_target,
                 self.predicted_tokens ])
 
           cum_loss = loss + cum_loss
-          if step % 5000 == 0:
-            log.debug('Epoch: %d, Loss %s\n\ttarget: %s\n\tpredicted: %s' 
+          if global_step % 1000 == 0:
+            log.debug('Epoch: %d, step:%d, Loss %s\n\ttarget: %s\n\tpredicted: %s' 
                 % (epoch,
+                   global_step,
                    cum_loss, 
-                   convert_id_tok(target, id_tok), 
-                   convert_id_tok(out, id_tok)))
+                   convert_id_tok(target, self.id_tok)[:50],
+                   convert_id_tok(out, self.id_tok)[:50]))
             cum_loss = 0
             log.debug('Saved model checkpoint to %s.' % FLAGS.checkpoint_prefix)
-            self.saver.save(sess, FLAGS.checkpoint_prefix, global_step=step)
+            self.saver.save(sess, FLAGS.checkpoint_prefix, 
+                global_step=global_step)
 
-          file_writer.add_summary(summary_output, global_step=i)
+          file_writer.add_summary(summary_output, global_step=global_step)
+          global_step = global_step + 1
+
+      self.coord.request_stop()
+      self.coord.join(self.threads)
 
 def get_data():
   train_data, tok_id, id_tok  = reader.prepare_data(FLAGS.train_data,
@@ -218,7 +235,9 @@ def get_data():
   dev_data = reader.squash_data(dev_data)
 
   log.debug('Train data: %s' % train_data[:10])
+  log.info('Length of training data: %d' % len(train_data))
   log.debug('Dev data: %s' % dev_data[:10])
+  log.info('Length of dev data: %d' % len(dev_data))
 
   return train_data, dev_data, tok_id, id_tok
 
