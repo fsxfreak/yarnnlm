@@ -11,7 +11,6 @@ flags.DEFINE_float('learning_rate', 0.1, 'Initial learning rate.')
 flags.DEFINE_integer('max_epochs', 10, 'Maximum number of epochs.')
 flags.DEFINE_integer('hidden_dim', 128, 'RNN hidden state size.')
 flags.DEFINE_integer('max_time_steps', 20, 'Truncated backprop length.')
-flags.DEFINE_integer('batch_size', 40, 'Num examples per minibatch.')
 
 flags.DEFINE_integer('vocab_size', 30000, 'Vocabulary size.')
 flags.DEFINE_string('vocab_data', 'vocab.pkl', 'Vocabulary file.')
@@ -37,13 +36,15 @@ def convert_id_tok(samples, id_tok):
   s_raw = [ id_tok[sample] for sample in samples ]
   return ' '.join(s_raw)
 
-class RNNLM(object):
-  def __init__(self, train_data, dev_data, id_tok):
-    self.train_data = train_data
-    self.dev_data = dev_data
-    self.id_tok = id_tok
-
-    self.build_input()
+class RNN(object):
+  def __init__(self):
+    '''
+    init with hyperparameters here
+    '''
+    with tf.variable_scope('Input'):
+      # inputs are a sequence of token ids, target is one time step forward 
+      self.data_input = tf.placeholder(tf.int32, [ FLAGS.max_time_steps ], 'x')
+      self.data_target = tf.placeholder(tf.int32, [ FLAGS.max_time_steps ], 'y')
     with tf.variable_scope('Embedding'):
       # map from one-hot encoding to hidden vector 
       self.embedding = tf.get_variable(
@@ -67,41 +68,6 @@ class RNNLM(object):
     self.build_inference()
     self.build_loss()
     self.build_optimizer()
-
-  def build_input(self):
-    with tf.variable_scope('Input'):
-      # inputs are a sequence of token ids, target is one time step forward 
-      # adapted from tensorflow ptb_word_lm tutorial
-      train_tensor_raw = tf.convert_to_tensor(self.train_data)
-
-      data_len = tf.size(train_tensor_raw)
-      batch_len = data_len // FLAGS.batch_size
-
-      # strip examples which do not divide evenly, OK for an LM
-      train_tensor = tf.reshape(
-          train_tensor_raw[0 : FLAGS.batch_size * batch_len],
-          [ FLAGS.batch_size, batch_len ])
-
-      epoch_size = (batch_len - 1) // FLAGS.max_time_steps
-      assertion = tf.assert_positive(                                 
-          epoch_size,                                                 
-          message="epoch_size == 0, decrease batch_size or max_time_steps")
-      with tf.control_dependencies([assertion]):                      
-        epoch_size = tf.identity(epoch_size, name="epoch_size")       
-
-      i = tf.train.range_input_producer(epoch_size, shuffle=False).dequeue()
-
-      self.data_input = tf.strided_slice(
-          train_tensor,
-          [ 0, i * FLAGS.max_time_steps ],
-          [ FLAGS.batch_size, (i + 1) * FLAGS.max_time_steps ], name='x')
-      self.data_target = tf.strided_slice(
-          train_tensor,
-          [ 0, i * FLAGS.max_time_steps + 1 ],
-          [ FLAGS.batch_size, (i + 1) * FLAGS.max_time_steps + 1], name='y')
-
-      self.data_input.set_shape([ FLAGS.batch_size, FLAGS.max_time_steps ])
-      self.data_target.set_shape([ FLAGS.batch_size, FLAGS.max_time_steps ])
 
   def build_recurrence(self, h_prev, x_m):
     # expand_dims used to convert 1d array to 1d vector
@@ -129,6 +95,10 @@ class RNNLM(object):
 
   def build_loss(self):
     with tf.variable_scope('Loss'):
+      # self.predicted_tokens = tf.argmax(self.token_probs, axis=1) 
+      # TODO decoding?
+      # https://www.tensorflow.org/api_guides/python/nn#Classification
+      # NOTE: can look here to see another functions
       self.losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
           name='losses',
           labels=self.data_target,
@@ -157,13 +127,10 @@ class RNNLM(object):
       log.debug('Model restored from %s.' % ckpt.model_checkpoint_path)
     else:
       sess.run(tf.global_variables_initializer())
-      sess.run(tf.local_variables_initializer())
       self.saver.save(sess, FLAGS.checkpoint_prefix, global_step=0)
       log.debug('Initialized new model.')
 
-    threads = tf.train.start_queue_runners(sess=sess)
-
-  def train(self):
+  def train(self, data, id_tok):
     verbose = FLAGS.output_mode == 'verbose'
     with tf.Session(config=tf.ConfigProto(allow_soft_placement=verbose,
                     log_device_placement=verbose,
@@ -175,38 +142,39 @@ class RNNLM(object):
           sess.graph)
       summaries = tf.summary.merge_all()
 
+      window = FLAGS.max_time_steps
       log.info('Starting training...')
       log.debug('Training %s' % tf.trainable_variables())
 
-      data_len = len(self.train_data)
-      num_steps = ((data_len // FLAGS.batch_size) - 1) // FLAGS.max_time_steps
+      cum_loss = 0.0
+      for i in range(0, len(data) - window + 1):
+        source = data[i     : i + window]
+        target = data[i + 1 : i + window + 1]
 
-      for epoch in range(FLAGS.max_epochs):
-        cum_loss = 0.0
-        for step in range(num_steps):
-          if len(source) < window:
-            source = np.pad(source, (0, window - len(source)), 
-                mode='constant', constant_values=(0, reader.PAD_ID))
-          if len(target) < window:
-            target = np.pad(target, (0, window - len(target)), 
-                mode='constant', constant_values=(0, reader.PAD_ID))
+        if len(source) < window:
+          source = np.pad(source, (0, window - len(source)), (0, reader.PAD_ID))
+        if len(target) < window:
+          target = np.pad(target, (0, window - len(target)), (0, reader.PAD_ID))
 
-          _, loss, summary_output, out = sess.run(
-              [ self.minimizer, self.loss, summaries,
-                self.predicted_tokens ])
+        _, loss, summary_output, out = sess.run(
+            [ self.minimizer, self.loss, summaries,
+              self.predicted_tokens ],
+            feed_dict={
+              self.data_input : source,
+              self.data_target: target
+            })
 
-          cum_loss = loss + cum_loss
-          if step % 5000 == 0:
-            log.debug('Epoch: %d, Loss %s\n\ttarget: %s\n\tpredicted: %s' 
-                % (epoch,
-                   cum_loss, 
-                   convert_id_tok(target, id_tok), 
-                   convert_id_tok(out, id_tok)))
-            cum_loss = 0
-            log.debug('Saved model checkpoint to %s.' % FLAGS.checkpoint_prefix)
-            self.saver.save(sess, FLAGS.checkpoint_prefix, global_step=step)
+        cum_loss = loss + cum_loss
+        if i % 5000 == 0:
+          log.debug('Loss %s\n\ttarget: %s\n\tpredicted: %s' 
+              % (cum_loss, 
+                 convert_id_tok(target, id_tok), 
+                 convert_id_tok(out, id_tok)))
+          cum_loss = 0
+          log.debug('Saved model checkpoint to %s.' % FLAGS.checkpoint_prefix)
+          self.saver.save(sess, FLAGS.checkpoint_prefix, global_step=i)
 
-          file_writer.add_summary(summary_output, global_step=i)
+        file_writer.add_summary(summary_output, global_step=i)
 
 def get_data():
   train_data, tok_id, id_tok  = reader.prepare_data(FLAGS.train_data,
@@ -214,19 +182,25 @@ def get_data():
   dev_data, _, _ = reader.prepare_data(FLAGS.dev_data,
       FLAGS.vocab_data, FLAGS.vocab_size)
 
-  train_data = reader.squash_data(train_data)
-  dev_data = reader.squash_data(dev_data)
-
-  log.debug('Train data: %s' % train_data[:10])
-  log.debug('Dev data: %s' % dev_data[:10])
+  log.debug('Train data: %s' % train_data[:2])
+  log.debug('Dev data: %s' % dev_data[:2])
 
   return train_data, dev_data, tok_id, id_tok
+
+def resize_data(data):
+  '''
+  Squash all sentences together.
+  '''
+  squashed = np.concatenate(data)
+  return squashed
 
 def main(_):
   train_data, dev_data, tok_id, id_tok = get_data()
 
-  model = RNNLM(train_data, dev_data, id_tok)
-  model.train()
+  train_data = resize_data(train_data)
+
+  model = RNN()
+  model.train(train_data, id_tok)
 
 if __name__ == '__main__':
   if FLAGS.output_mode == 'debug' or FLAGS.output_mode == 'verbose':

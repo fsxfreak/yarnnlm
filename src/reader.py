@@ -130,19 +130,28 @@ def load_vocab(vocab_filename, lines=None, max_vocab_size=None):
   if os.path.exists(vocab_filename):
     with open(vocab_filename, 'rb') as f:
       tok_id = pkl.load(f)
+    log.info('Loaded vocabulary of size: %d from %s.' 
+        % (len(tok_id), vocab_filename))
   else:
     if lines is None or max_vocab_size is None:
       raise ValueError('Could not load vocabulary or create it.')
     tok_id = build_vocab(lines, max_vocab_size)
+    log.info('Saved new vocabulary of size: %d to %s.' 
+        % (len(tok_id), vocab_filename))
     save_vocab(vocab_filename, tok_id)
 
-  log.info('Loaded vocabulary of size: %d to %s.' 
-      % (len(tok_id), vocab_filename))
   assert len(tok_id) <= max_vocab_size
 
   id_tok = extract_reverse_vocab(tok_id)
 
   return tok_id, id_tok
+
+def squash_data(data):
+  '''
+  Squash all sentences together.
+  '''
+  squashed = np.concatenate(data)
+  return squashed
 
 def prepare_data(data_filename, vocab_filename, vocab_size=30000):
   '''
@@ -155,7 +164,7 @@ def prepare_data(data_filename, vocab_filename, vocab_size=30000):
 
   data = np.array(vocab_replace_data(raw_data, tok_id))
   return data, tok_id, id_tok
-          
+
 def main():
   train_data = read_data('train.txt')
 
