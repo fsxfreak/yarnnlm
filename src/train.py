@@ -7,15 +7,16 @@ import numpy as np
 import reader
 
 flags = tf.app.flags
-flags.DEFINE_float('learning_rate', 0.1, 'Initial learning rate.')
-flags.DEFINE_float('prob_dropout', 0.2, 'Dropout probability.')
+flags.DEFINE_float('learning_rate', 0.2, 'Initial learning rate.')
+flags.DEFINE_float('prob_dropout', 0.3, 'Dropout probability.')
 flags.DEFINE_integer('max_epochs', 500, 'Maximum number of epochs.')
-flags.DEFINE_integer('hidden_dim', 128, 'RNN hidden state size.')
-flags.DEFINE_integer('max_time_steps', 20, 'Truncated backprop length.')
+flags.DEFINE_integer('hidden_dim', 256, 'RNN hidden state size.')
+flags.DEFINE_integer('max_time_steps', 40, 'Truncated backprop length.')
 flags.DEFINE_integer('batch_size', 128, 'Num examples per minibatch.')
 flags.DEFINE_integer('hidden_layers', 2, 'Num of RNN layers.')
+flags.DEFINE_integer('max_grad_norm', 10, 'Clip gradients above this norm.')
 
-flags.DEFINE_integer('vocab_size', 30000, 'Vocabulary size.')
+flags.DEFINE_integer('vocab_size', 40000, 'Vocabulary size.')
 flags.DEFINE_string('vocab_data', 'vocab.pkl', 'Vocabulary file.')
 flags.DEFINE_string('train_data', 'train.shuf.txt', 'Training data.')
 flags.DEFINE_string('dev_data', 'dev.txt', 'Validation data.')
@@ -61,11 +62,20 @@ class RNNLM(object):
           output_keep_prob=(1.0 - FLAGS.prob_dropout))
       rnn_layers = tf.nn.rnn_cell.MultiRNNCell([ cell ] * FLAGS.hidden_layers)
 
-      self.initial_hidden_state = rnn_layers.zero_state(
-          FLAGS.batch_size, dtype=tf.float32)
+      self.initial_state = np.zeros(
+          (FLAGS.hidden_layers, 2, FLAGS.batch_size, FLAGS.hidden_dim))
+
+      self.state = tf.placeholder(tf.float32, self.initial_state.shape,
+          name='rnn_state')
+      l = tf.unstack(self.state, axis=0)
+      rnn_state = tuple(
+          [ tf.nn.rnn_cell.LSTMStateTuple(l[i][0], l[i][1])
+              for i in range(FLAGS.hidden_layers) ]
+          )
+
       self.hidden_outputs, self.next_state = tf.nn.dynamic_rnn(
           rnn_layers, self.embedded_input, 
-          initial_state=self.initial_hidden_state)
+          initial_state=rnn_state)
       log.debug('hidden output shape: %s' % self.hidden_outputs.shape)
 
     self.build_inference()
@@ -157,14 +167,21 @@ class RNNLM(object):
     optimizer using the loss function
     '''
     with tf.variable_scope('Optimizer'):
-      #tf.train.optimizer.minimize(self.loss, name='optimizer')
       self.optimizer = tf.train.GradientDescentOptimizer(FLAGS.learning_rate)
-      self.minimizer = self.optimizer.minimize(self.loss, name='minimizer')
+
+      self.gradients, _ = tf.clip_by_global_norm(
+          tf.gradients(self.loss, tf.trainable_variables()), 
+          FLAGS.max_grad_norm)
+      self.minimizer = self.optimizer.apply_gradients(
+          zip(self.gradients, tf.trainable_variables()),
+          global_step=tf.contrib.framework.get_or_create_global_step())
+      #self.minimizer = self.optimizer.minimize(self.loss, name='minimizer')
 
       tf.summary.scalar("learning_rate", self.optimizer._learning_rate)
 
   def _load_or_create(self, sess):
-    ckpt = tf.train.get_checkpoint_state(os.path.dirname(FLAGS.checkpoint_prefix))
+    ckpt = tf.train.get_checkpoint_state(
+      os.path.dirname(FLAGS.checkpoint_prefix))
     self.saver = tf.train.Saver()
 
     if ckpt and ckpt.model_checkpoint_path:
@@ -178,6 +195,9 @@ class RNNLM(object):
 
     self.coord = tf.train.Coordinator()
     self.threads = tf.train.start_queue_runners(sess=sess, coord=self.coord)
+
+  def validate(self, session):
+    pass 
 
   def train(self):
     verbose = FLAGS.output_mode == 'verbose'
@@ -200,19 +220,23 @@ class RNNLM(object):
       global_step = 0
       cum_loss = 0.0
       for epoch in range(FLAGS.max_epochs):
+        state = self.initial_state
         for step in range(num_steps):
-          _, loss, summary_output, target, out = sess.run(
+          _, loss, summary_output, state, target, out = sess.run(
               [ self.minimizer, self.loss, summaries,
+                self.next_state,
                 self.data_target,
-                self.predicted_tokens ])
+                self.predicted_tokens ],
+              feed_dict={
+                self.state : state
+              })
 
           cum_loss = loss + cum_loss
           if global_step % 1000 == 0:
-            log.debug('Epoch: %d, step:%d, Loss %s\n\ttarget: %s\n\tpredicted: %s' 
-                % (epoch,
-                   global_step,
-                   cum_loss, 
-                   convert_id_tok(target, self.id_tok)[:50],
+            log.info('Epoch: %d, step: %d, loss %s' 
+                % (epoch, global_step, cum_loss))
+            log.debug('\ttarg: %s\n\tpred: %s' 
+                % (convert_id_tok(target, self.id_tok)[:50],
                    convert_id_tok(out, self.id_tok)[:50]))
             cum_loss = 0
             log.debug('Saved model checkpoint to %s.' % FLAGS.checkpoint_prefix)
