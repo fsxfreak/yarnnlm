@@ -1,5 +1,5 @@
 import logging as log
-import os, sys, time
+import os, sys, timeit
 
 import tensorflow as tf
 import numpy as np
@@ -17,24 +17,26 @@ flags.DEFINE_integer('hidden_layers', 2, 'Num of RNN layers.')
 flags.DEFINE_integer('max_grad_norm', 10, 'Clip gradients above this norm.')
 
 flags.DEFINE_integer('vocab_size', 40000, 'Vocabulary size.')
-flags.DEFINE_string('vocab_data', 'vocab.pkl', 'Vocabulary file.')
-flags.DEFINE_string('train_data', 'train.shuf.txt', 'Training data.')
-flags.DEFINE_string('dev_data', 'dev.txt', 'Validation data.')
+flags.DEFINE_string('vocab_data', 'data/vocab.pkl', 'Vocabulary file.')
+flags.DEFINE_string('train_data', 'data/train.shuf.txt', 'Training data.')
+flags.DEFINE_string('dev_data', 'data/dev.txt', 'Validation data.')
 
 flags.DEFINE_string('checkpoint_prefix', 
   '/nfs/topaz/lcheung/models/tf-test/model',
   'Prefix of checkpoint files.')
 flags.DEFINE_string('run_name', 
-  'dyn_rnn',
+  'dyn_rnn6',
   'Run name in tensorboard.')
 
-flags.DEFINE_string('output_mode', 'debug', 'verbose | debug | info')
+flags.DEFINE_string('output_mode', 'debug', 'verbose|debug|info')
 flags.DEFINE_string('tf_log_dir', '/nfs/topaz/lcheung/tensorboard',
   'Path to store tensorboard log files.')
 
 FLAGS = flags.FLAGS
 
-log.basicConfig(stream=sys.stderr, level=log.INFO)
+log.basicConfig(stream=sys.stderr, level=log.INFO,
+    format='%(asctime)s [%(levelname)s]:%(message)s',  
+    datefmt='%Y-%m-%d %H:%M:%S')                        
 
 def convert_id_tok(batches, id_tok):
   s_raw = [ id_tok[sample] for batch in batches for sample in batch ]
@@ -46,7 +48,42 @@ class RNNLM(object):
     self.dev_data = dev_data
     self.id_tok = id_tok
 
+    self.global_step = tf.Variable(0, trainable=False, name='global_step')
+
     self.build_input()
+    self.build_embedding()
+    self.build_rnn()
+    self.build_inference()
+    self.build_loss()
+    self.build_optimizer()
+
+  def build_input(self):
+    with tf.variable_scope('Input'):
+      # one batch is spans batch_size + max_time_steps + 1, because
+      # there are batch_size source/target pairs, with target shifted to
+      # the right of source by 1
+      self.batch_len = FLAGS.batch_size + FLAGS.max_time_steps + 1
+      self.data_raw = tf.placeholder(tf.int32, shape=[ self.batch_len ], 
+          name='raw_xy')
+
+      # NOTE: samples which do not divide evenly at the end of the data will 
+      # not be used
+      self.batches_per_epoch = len(self.train_data) // self.batch_len
+      self.batch_select = tf.train.range_input_producer(
+          self.batches_per_epoch, shuffle=True, name='batch_index').dequeue()
+
+      sliced = []
+      for i in range(FLAGS.batch_size):
+        sliced.append(tf.slice(self.data_raw, [i], [ FLAGS.max_time_steps ]))
+      self.data_input = tf.stack(sliced, name='x')
+      log.debug('Data input shape: %s' % self.data_input.shape)
+      sliced = []
+      for i in range(FLAGS.batch_size):
+        sliced.append(tf.slice(self.data_raw, [i+1], [ FLAGS.max_time_steps ]))
+      self.data_target = tf.stack(sliced, name='y')
+      log.debug('Data target shape: %s' % self.data_input.shape)
+
+  def build_embedding(self):
     with tf.variable_scope('Embedding'):
       # map from one-hot encoding to hidden vector 
       self.embedding = tf.get_variable(
@@ -54,6 +91,8 @@ class RNNLM(object):
       self.embedded_input = tf.nn.embedding_lookup(
           self.embedding, self.data_input, name='x_m') 
       log.debug('Embedded input shape: %s' % self.embedded_input.shape)
+
+  def build_rnn(self):
     with tf.variable_scope('RNN'):
       # need to keep the embedded input, then feed those in as inputs
       # into the tf nn dynamic rnn cell
@@ -77,45 +116,6 @@ class RNNLM(object):
           rnn_layers, self.embedded_input, 
           initial_state=rnn_state)
       log.debug('hidden output shape: %s' % self.hidden_outputs.shape)
-
-    self.build_inference()
-    self.build_loss()
-    self.build_optimizer()
-
-  def build_input(self):
-    with tf.variable_scope('Input'):
-      # inputs are a sequence of token ids, target is one time step forward 
-      # adapted from tensorflow ptb_word_lm tutorial
-      train_tensor_raw = tf.convert_to_tensor(self.train_data)
-
-      data_len = tf.size(train_tensor_raw)
-      batch_len = data_len // FLAGS.batch_size
-
-      # strip examples which do not divide evenly, OK for an LM
-      train_tensor = tf.reshape(
-          train_tensor_raw[0 : FLAGS.batch_size * batch_len],
-          [ FLAGS.batch_size, batch_len ])
-
-      epoch_size = (batch_len - 1) // FLAGS.max_time_steps
-      assertion = tf.assert_positive(                                 
-          epoch_size,                                                 
-          message="epoch_size == 0, decrease batch_size or max_time_steps")
-      with tf.control_dependencies([assertion]):                      
-        epoch_size = tf.identity(epoch_size, name="epoch_size")       
-
-      i = tf.train.range_input_producer(epoch_size, shuffle=False).dequeue()
-
-      self.data_input = tf.strided_slice(
-          train_tensor,
-          [ 0, i * FLAGS.max_time_steps ],
-          [ FLAGS.batch_size, (i + 1) * FLAGS.max_time_steps ], name='x')
-      self.data_target = tf.strided_slice(
-          train_tensor,
-          [ 0, i * FLAGS.max_time_steps + 1 ],
-          [ FLAGS.batch_size, (i + 1) * FLAGS.max_time_steps + 1], name='y')
-
-      self.data_input.set_shape([ FLAGS.batch_size, FLAGS.max_time_steps ])
-      self.data_target.set_shape([ FLAGS.batch_size, FLAGS.max_time_steps ])
 
   def build_inference(self):
     with tf.variable_scope('Inference'):
@@ -174,8 +174,7 @@ class RNNLM(object):
           FLAGS.max_grad_norm)
       self.minimizer = self.optimizer.apply_gradients(
           zip(self.gradients, tf.trainable_variables()),
-          global_step=tf.contrib.framework.get_or_create_global_step())
-      #self.minimizer = self.optimizer.minimize(self.loss, name='minimizer')
+          global_step=self.global_step)
 
       tf.summary.scalar("learning_rate", self.optimizer._learning_rate)
 
@@ -190,14 +189,39 @@ class RNNLM(object):
     else:
       sess.run(tf.global_variables_initializer())
       sess.run(tf.local_variables_initializer())
-      self.saver.save(sess, FLAGS.checkpoint_prefix, global_step=0)
+      self.saver.save(sess, FLAGS.checkpoint_prefix,
+          global_step=self.global_step)
       log.debug('Initialized new model.')
 
     self.coord = tf.train.Coordinator()
     self.threads = tf.train.start_queue_runners(sess=sess, coord=self.coord)
 
-  def validate(self, session):
-    pass 
+  def validate(self, sess):
+    log.info('Running validation pass...')
+
+    state = self.initial_state
+    cum_loss = 0.0
+    for i in range(len(self.dev_data) - self.batch_len):
+      data_begin = i * self.batch_len
+      data_end = data_begin + self.batch_len
+      loss, state, target, out = sess.run(
+          [ self.loss, 
+            self.next_state,
+            self.data_target,
+            self.predicted_tokens ],
+          feed_dict={
+            self.state : state,
+            self.data_raw : self.dev_data[data_begin : data_end]
+          })
+
+      if i % 10000 == 0:
+        log.debug('\n\ttarg: %s\n\tpred: %s' 
+            % (convert_id_tok(target, self.id_tok)[:FLAGS.max_time_steps],
+               convert_id_tok(out, self.id_tok)[:FLAGS.max_time_steps]))
+      cum_loss += loss
+
+    log.info('Validation loss: %.3f, num words: %d' 
+        % (cum_loss, len(self.dev_data)))
 
   def train(self):
     verbose = FLAGS.output_mode == 'verbose'
@@ -214,37 +238,54 @@ class RNNLM(object):
       log.info('Starting training...')
       log.debug('Training %s' % tf.trainable_variables())
 
-      data_len = len(self.train_data)
-      num_steps = ((data_len // FLAGS.batch_size) - 1) // FLAGS.max_time_steps
-
-      global_step = 0
       cum_loss = 0.0
       for epoch in range(FLAGS.max_epochs):
         state = self.initial_state
-        for step in range(num_steps):
+        time_begin = timeit.default_timer()
+        words_processed = 0
+
+        for step in range(self.batches_per_epoch):
+          batch_index = sess.run([ self.batch_select ])[0]
+          data_begin = batch_index * self.batch_len
+          data_end = data_begin + self.batch_len
+          words_processed += self.batch_len
+
+          global_step = tf.train.global_step(sess, self.global_step)
+
           _, loss, summary_output, state, target, out = sess.run(
-              [ self.minimizer, self.loss, summaries,
+              [ self.minimizer,  self.loss, summaries,
                 self.next_state,
                 self.data_target,
                 self.predicted_tokens ],
               feed_dict={
-                self.state : state
+                self.state : state,
+                self.data_raw : self.train_data[data_begin : data_end]
               })
 
           cum_loss = loss + cum_loss
           if global_step % 1000 == 0:
-            log.info('Epoch: %d, step: %d, loss %s' 
-                % (epoch, global_step, cum_loss))
-            log.debug('\ttarg: %s\n\tpred: %s' 
-                % (convert_id_tok(target, self.id_tok)[:50],
-                   convert_id_tok(out, self.id_tok)[:50]))
-            cum_loss = 0
+            time_elapsed = timeit.default_timer() - time_begin
+            wps = float(words_processed) / time_elapsed 
+
+            log.info('Epoch: %d, step: %d, wps: %.2f, loss %s'
+                % (epoch, global_step, wps, cum_loss))
+            log.debug('\n\ttarg: %s\n\tpred: %s' 
+                % (convert_id_tok(target, self.id_tok)[:FLAGS.max_time_steps],
+                   convert_id_tok(out, self.id_tok)[:FLAGS.max_time_steps]))
+
             log.debug('Saved model checkpoint to %s.' % FLAGS.checkpoint_prefix)
             self.saver.save(sess, FLAGS.checkpoint_prefix, 
                 global_step=global_step)
 
-          file_writer.add_summary(summary_output, global_step=global_step)
-          global_step = global_step + 1
+            cum_loss = 0
+            words_processed = 0
+            time_begin = timeit.default_timer()
+
+          if global_step % 5000 == 0:
+            self.validate(sess)
+
+          file_writer.add_summary(summary_output, 
+              global_step=global_step)
 
       self.coord.request_stop()
       self.coord.join(self.threads)
