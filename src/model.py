@@ -9,7 +9,7 @@ import reader
 flags = tf.app.flags
 flags.DEFINE_float('learning_rate', 0.2, 'Initial learning rate.')
 flags.DEFINE_float('prob_dropout', 0.3, 'Dropout probability.')
-flags.DEFINE_integer('max_epochs', 500, 'Maximum number of epochs.')
+flags.DEFINE_integer('max_epochs', 50, 'Maximum number of epochs.')
 flags.DEFINE_integer('hidden_dim', 256, 'RNN hidden state size.')
 flags.DEFINE_integer('max_time_steps', 40, 'Truncated backprop length.')
 flags.DEFINE_integer('batch_size', 128, 'Num examples per minibatch.')
@@ -20,12 +20,14 @@ flags.DEFINE_integer('vocab_size', 40000, 'Vocabulary size.')
 flags.DEFINE_string('vocab_data', 'data/vocab.pkl', 'Vocabulary file.')
 flags.DEFINE_string('train_data', 'data/train.shuf.txt', 'Training data.')
 flags.DEFINE_string('dev_data', 'data/dev.txt', 'Validation data.')
+flags.DEFINE_string('predict_data', 'data/test.txt',
+    'Generate sentences for each seed line of this file.')
 
 flags.DEFINE_string('checkpoint_prefix', 
   '/nfs/topaz/lcheung/models/tf-test/model',
   'Prefix of checkpoint files.')
 flags.DEFINE_string('run_name', 
-  'dyn_rnn6',
+  'testrun',
   'Run name in tensorboard.')
 
 flags.DEFINE_string('output_mode', 'debug', 'verbose|debug|info')
@@ -39,7 +41,8 @@ log.basicConfig(stream=sys.stderr, level=log.INFO,
     datefmt='%Y-%m-%d %H:%M:%S')                        
 
 def convert_id_tok(batches, id_tok):
-  s_raw = [ id_tok[sample] for batch in batches for sample in batch ]
+  s_raw = [ id_tok[sample] for batch in batches for sample in batch 
+              if sample < len(id_tok)]
   return ' '.join(s_raw)
 
 class RNNLM(object):
@@ -48,17 +51,20 @@ class RNNLM(object):
     self.dev_data = dev_data
     self.id_tok = id_tok
 
-    self.global_step = tf.Variable(0, trainable=False, name='global_step')
+    self.graph = tf.Graph()
 
-    self.build_input()
-    self.build_embedding()
-    self.build_rnn()
-    self.build_inference()
-    self.build_loss()
-    self.build_optimizer()
+    with self.graph.as_default():
+      self.global_step = tf.Variable(0, trainable=False, name='global_step')
+
+      self.build_input()
+      self.build_embedding()
+      self.build_rnn()
+      self.build_inference()
+      self.build_loss()
+      self.build_optimizer()
 
   def build_input(self):
-    with tf.variable_scope('Input'):
+    with tf.variable_scope('Input', reuse=True):
       # one batch is spans batch_size + max_time_steps + 1, because
       # there are batch_size source/target pairs, with target shifted to
       # the right of source by 1
@@ -151,13 +157,13 @@ class RNNLM(object):
           logits=self.logits)
       self.loss = tf.reduce_mean(self.losses, name='loss')
       '''
-      self.loss = tf.reduce_sum(tf.contrib.seq2seq.sequence_loss(
+      self.loss = tf.contrib.seq2seq.sequence_loss(
           self.logits,
           self.data_target,
           tf.ones([ FLAGS.batch_size, FLAGS.max_time_steps], dtype=tf.float32),
-          average_across_timesteps=False,
+          average_across_timesteps=True,
           average_across_batch=True,
-          name='loss'))
+          name='loss')
 
       tf.summary.scalar("loss_smy", self.loss)
       log.debug('Loss shape; %s' % self.loss.shape)
@@ -179,22 +185,39 @@ class RNNLM(object):
       tf.summary.scalar("learning_rate", self.optimizer._learning_rate)
 
   def _load_or_create(self, sess):
-    ckpt = tf.train.get_checkpoint_state(
-      os.path.dirname(FLAGS.checkpoint_prefix))
-    self.saver = tf.train.Saver()
+    with self.graph.as_default():
+      ckpt = tf.train.get_checkpoint_state(
+        os.path.dirname(FLAGS.checkpoint_prefix))
+      self.saver = tf.train.Saver()
 
-    if ckpt and ckpt.model_checkpoint_path:
-      self.saver.restore(sess, ckpt.model_checkpoint_path)
-      log.debug('Model restored from %s.' % ckpt.model_checkpoint_path)
-    else:
-      sess.run(tf.global_variables_initializer())
-      sess.run(tf.local_variables_initializer())
-      self.saver.save(sess, FLAGS.checkpoint_prefix,
-          global_step=self.global_step)
-      log.debug('Initialized new model.')
+      if ckpt and ckpt.model_checkpoint_path:
+        self.saver.restore(sess, ckpt.model_checkpoint_path)
+        log.debug('Model restored from %s.' % ckpt.model_checkpoint_path)
+      else:
+        sess.run(tf.global_variables_initializer())
+        sess.run(tf.local_variables_initializer())
+        self.saver.save(sess, FLAGS.checkpoint_prefix,
+            global_step=self.global_step)
+        log.debug('Initialized new model.')
 
-    self.coord = tf.train.Coordinator()
-    self.threads = tf.train.start_queue_runners(sess=sess, coord=self.coord)
+      self.coord = tf.train.Coordinator()
+      self.threads = tf.train.start_queue_runners(sess=sess, coord=self.coord)
+
+  def _load(self, sess):
+    with self.graph.as_default():
+      ckpt = tf.train.get_checkpoint_state(
+        os.path.dirname(FLAGS.checkpoint_prefix))
+      self.saver = tf.train.Saver()
+
+      if ckpt and ckpt.model_checkpoint_path:
+        self.saver.restore(sess, ckpt.model_checkpoint_path)
+        log.debug('Model restored from %s.' % ckpt.model_checkpoint_path)
+      else:
+        raise ValueError('Unable to find existing trained model at: '
+            % ckpt.model_checkpoint_path)
+
+      self.coord = tf.train.Coordinator()
+      self.threads = tf.train.start_queue_runners(sess=sess, coord=self.coord)
 
   def validate(self, sess):
     log.info('Running validation pass...')
@@ -204,6 +227,11 @@ class RNNLM(object):
     for i in range(len(self.dev_data) - self.batch_len):
       data_begin = i * self.batch_len
       data_end = data_begin + self.batch_len
+
+      data = self.dev_data[data_begin : data_end]
+      if len(data) != self.batch_len:
+        continue
+
       loss, state, target, out = sess.run(
           [ self.loss, 
             self.next_state,
@@ -223,9 +251,71 @@ class RNNLM(object):
     log.info('Validation loss: %.3f, num words: %d' 
         % (cum_loss, len(self.dev_data)))
 
+  def predict(self, data):
+    log.info('Predicting test data...')
+    verbose = FLAGS.output_mode == 'verbose'
+    with tf.Session(graph=self.graph,
+                    config=tf.ConfigProto(allow_soft_placement=verbose,
+                    log_device_placement=verbose,
+                    gpu_options=tf.GPUOptions(allow_growth=True))) as sess:
+      self._load(sess)
+
+      for line in data:
+        state = self.initial_state
+
+        source = np.pad(np.array(line), 
+            (0, self.batch_len - len(line) % self.batch_len), 'constant')
+        predict_index = len(line) - 2
+
+        log.debug('Seeding with: %s' % 
+            convert_id_tok([ source[:predict_index + 1] ], self.id_tok))
+        probs, preds, state = sess.run(
+            [ self.token_probs, self.predicted_tokens, self.next_state ],
+            feed_dict={
+              self.state : state,
+              self.data_raw : source
+              })
+      
+        pred_word_id = preds[0][predict_index]
+        pred_word = self.id_tok[pred_word_id]
+        prob_pred = probs[0][predict_index][pred_word_id] 
+        log.debug('pred: %s' % pred_word)
+        log.debug('prob: %f' % prob_pred)
+
+        while pred_word != '<EOS>' and predict_index < FLAGS.max_time_steps - 1:
+          source[predict_index + 1] = pred_word_id
+          predict_index += 1
+
+          probs, preds, state = sess.run(
+              [ self.token_probs, self.predicted_tokens, self.next_state ],
+              feed_dict={
+                self.state : state,
+                self.data_raw : source
+                })
+        
+          pred_word_id = preds[0][predict_index]
+          pred_word = self.id_tok[pred_word_id]
+          prob_pred = probs[0][predict_index][pred_word_id] 
+          log.debug('pred: %s' % pred_word)
+          log.debug('prob: %f' % prob_pred)
+
+      self.coord.request_stop()
+      self.coord.join(self.threads)
+
+  def force_decode(self):
+    log.info('Force decoding test data...')
+    verbose = FLAGS.output_mode == 'verbose'
+    with tf.Session(graph=self.graph,
+                    config=tf.ConfigProto(allow_soft_placement=verbose,
+                    log_device_placement=verbose,
+                    gpu_options=tf.GPUOptions(allow_growth=True))) as sess:
+      state = self.initial_state
+
+
   def train(self):
     verbose = FLAGS.output_mode == 'verbose'
-    with tf.Session(config=tf.ConfigProto(allow_soft_placement=verbose,
+    with tf.Session(graph=self.graph,
+                    config=tf.ConfigProto(allow_soft_placement=verbose,
                     log_device_placement=verbose,
                     gpu_options=tf.GPUOptions(allow_growth=True))) as sess:
       self._load_or_create(sess)
@@ -248,13 +338,14 @@ class RNNLM(object):
           batch_index = sess.run([ self.batch_select ])[0]
           data_begin = batch_index * self.batch_len
           data_end = data_begin + self.batch_len
-          words_processed += self.batch_len
+          words_processed += FLAGS.batch_size * FLAGS.max_time_steps
 
           global_step = tf.train.global_step(sess, self.global_step)
 
-          _, loss, summary_output, state, target, out = sess.run(
+          _, loss, summary_output, state, source, target, out = sess.run(
               [ self.minimizer,  self.loss, summaries,
                 self.next_state,
+                self.data_input,
                 self.data_target,
                 self.predicted_tokens ],
               feed_dict={
@@ -269,8 +360,9 @@ class RNNLM(object):
 
             log.info('Epoch: %d, step: %d, wps: %.2f, loss %s'
                 % (epoch, global_step, wps, cum_loss))
-            log.debug('\n\ttarg: %s\n\tpred: %s' 
-                % (convert_id_tok(target, self.id_tok)[:FLAGS.max_time_steps],
+            log.debug('\n\tsrc: %s\n\ttarg: %s\n\tpred: %s' 
+                % (convert_id_tok(source, self.id_tok)[:FLAGS.max_time_steps],
+                   convert_id_tok(target, self.id_tok)[:FLAGS.max_time_steps],
                    convert_id_tok(out, self.id_tok)[:FLAGS.max_time_steps]))
 
             log.debug('Saved model checkpoint to %s.' % FLAGS.checkpoint_prefix)
@@ -311,6 +403,10 @@ def main(_):
 
   model = RNNLM(train_data, dev_data, id_tok)
   model.train()
+
+  predict_data, _, _ = reader.prepare_data(FLAGS.predict_data,
+      FLAGS.vocab_data, FLAGS.vocab_size)
+  model.predict(predict_data)
 
 if __name__ == '__main__':
   if FLAGS.output_mode == 'debug' or FLAGS.output_mode == 'verbose':

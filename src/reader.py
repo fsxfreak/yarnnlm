@@ -140,7 +140,8 @@ def load_vocab(vocab_filename, lines=None, max_vocab_size=None):
         % (len(tok_id), vocab_filename))
     save_vocab(vocab_filename, tok_id)
 
-  assert len(tok_id) <= max_vocab_size
+  if max_vocab_size:
+    assert len(tok_id) <= max_vocab_size
 
   id_tok = extract_reverse_vocab(tok_id)
 
