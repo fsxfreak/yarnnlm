@@ -7,12 +7,13 @@ import numpy as np
 import reader
 
 flags = tf.app.flags
-flags.DEFINE_float('learning_rate', 0.2, 'Initial learning rate.')
-flags.DEFINE_float('prob_dropout', 0.3, 'Dropout probability.')
+flags.DEFINE_float('learning_rate', 0.1, 'Initial learning rate.')
+flags.DEFINE_float('momentum', 0.8, 'Initial momentum.')
+flags.DEFINE_float('prob_dropout', 0.5, 'Dropout probability.')
 flags.DEFINE_integer('max_epochs', 50, 'Maximum number of epochs.')
 flags.DEFINE_integer('hidden_dim', 256, 'RNN hidden state size.')
 flags.DEFINE_integer('max_time_steps', 40, 'Truncated backprop length.')
-flags.DEFINE_integer('batch_size', 128, 'Num examples per minibatch.')
+flags.DEFINE_integer('batch_size', 64, 'Num examples per minibatch.')
 flags.DEFINE_integer('hidden_layers', 2, 'Num of RNN layers.')
 flags.DEFINE_integer('max_grad_norm', 10, 'Clip gradients above this norm.')
 
@@ -21,6 +22,8 @@ flags.DEFINE_string('vocab_data', 'data/vocab.pkl', 'Vocabulary file.')
 flags.DEFINE_string('train_data', 'data/train.shuf.txt', 'Training data.')
 flags.DEFINE_string('dev_data', 'data/dev.txt', 'Validation data.')
 flags.DEFINE_string('predict_data', 'data/test.txt',
+    'Generate sentences for each seed line of this file.')
+flags.DEFINE_string('score_data', 'data/play.txt',
     'Generate sentences for each seed line of this file.')
 
 flags.DEFINE_string('checkpoint_prefix', 
@@ -147,16 +150,26 @@ class RNNLM(object):
           name='predicteds')
       log.debug('shape of predicted tokens: %s' % self.predicted_tokens.shape)
 
+      # self.data_target : [ batch_size, max_time_steps ]
+      # self.token_probs : [ batch_size, max_time_steps, vocab_size ]
+      data_target_indices = tf.stack(
+        [
+          tf.range(FLAGS.batch_size * FLAGS.max_time_steps),
+          tf.reshape(self.data_target,
+                    [ FLAGS.batch_size * FLAGS.max_time_steps ])
+        ], axis=1)
+      log.debug('data_target_indices: %s' % data_target_indices.shape)
+      token_probs_flattened = tf.reshape(self.token_probs,
+          [ FLAGS.batch_size * FLAGS.max_time_steps, FLAGS.vocab_size])
+      log.debug('token_probs_flattened: %s' % token_probs_flattened.shape)
+      self.score = tf.gather_nd(token_probs_flattened, data_target_indices,
+          name='score')
+      log.debug('shape of score probs: %s' % self.score.shape)
+
   def build_loss(self):
     with tf.variable_scope('Loss'):
       log.debug('shape of targets: %s' % self.data_target.shape)
-      '''
-      self.losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
-          name='losses',
-          labels=self.data_target,
-          logits=self.logits)
-      self.loss = tf.reduce_mean(self.losses, name='loss')
-      '''
+
       self.loss = tf.contrib.seq2seq.sequence_loss(
           self.logits,
           self.data_target,
@@ -164,16 +177,20 @@ class RNNLM(object):
           average_across_timesteps=True,
           average_across_batch=True,
           name='loss')
+      log.debug('Loss shape; %s' % self.loss.shape)
+
+      self.perplexity = tf.pow(2, self.loss, name='perplexity')
 
       tf.summary.scalar("loss_smy", self.loss)
-      log.debug('Loss shape; %s' % self.loss.shape)
+      tf.summary.scalar("perplexity", self.perplexity)
 
   def build_optimizer(self):
     '''
     optimizer using the loss function
     '''
     with tf.variable_scope('Optimizer'):
-      self.optimizer = tf.train.GradientDescentOptimizer(FLAGS.learning_rate)
+      self.optimizer = tf.train.MomentumOptimizer(
+          FLAGS.learning_rate, FLAGS.momentum, use_nesterov=True)
 
       self.gradients, _ = tf.clip_by_global_norm(
           tf.gradients(self.loss, tf.trainable_variables()), 
@@ -181,8 +198,6 @@ class RNNLM(object):
       self.minimizer = self.optimizer.apply_gradients(
           zip(self.gradients, tf.trainable_variables()),
           global_step=self.global_step)
-
-      tf.summary.scalar("learning_rate", self.optimizer._learning_rate)
 
   def _load_or_create(self, sess):
     with self.graph.as_default():
@@ -213,8 +228,7 @@ class RNNLM(object):
         self.saver.restore(sess, ckpt.model_checkpoint_path)
         log.debug('Model restored from %s.' % ckpt.model_checkpoint_path)
       else:
-        raise ValueError('Unable to find existing trained model at: '
-            % ckpt.model_checkpoint_path)
+        raise ValueError('Unable to find existing trained model.')
 
       self.coord = tf.train.Coordinator()
       self.threads = tf.train.start_queue_runners(sess=sess, coord=self.coord)
@@ -302,14 +316,35 @@ class RNNLM(object):
       self.coord.request_stop()
       self.coord.join(self.threads)
 
-  def force_decode(self):
+  def force_decode(self, data):
     log.info('Force decoding test data...')
     verbose = FLAGS.output_mode == 'verbose'
     with tf.Session(graph=self.graph,
                     config=tf.ConfigProto(allow_soft_placement=verbose,
                     log_device_placement=verbose,
                     gpu_options=tf.GPUOptions(allow_growth=True))) as sess:
-      state = self.initial_state
+      self._load(sess)
+
+      for line in data:
+        state = self.initial_state
+
+        source = np.pad(np.array(line), 
+            (0, self.batch_len - len(line) % self.batch_len), 'constant')
+        predict_index = len(line) - 1
+
+        target, score, state = sess.run(
+            [ self.data_target, self.score, self.next_state ],
+            feed_dict={
+              self.state : state,
+              self.data_raw : source
+              })
+        target.shape = (FLAGS.batch_size * FLAGS.max_time_steps,)
+        log.debug('score: %.4f\ttarget: %s' 
+            % (np.mean(score[:predict_index]) * 10000.0, 
+               convert_id_tok([target[:predict_index]], self.id_tok)))
+
+      self.coord.request_stop()
+      self.coord.join(self.threads)
 
 
   def train(self):
@@ -402,11 +437,15 @@ def main(_):
   train_data, dev_data, tok_id, id_tok = get_data()
 
   model = RNNLM(train_data, dev_data, id_tok)
-  model.train()
+  #model.train()
 
-  predict_data, _, _ = reader.prepare_data(FLAGS.predict_data,
+  #predict_data, _, _ = reader.prepare_data(FLAGS.predict_data,
+  #    FLAGS.vocab_data, FLAGS.vocab_size)
+  #model.predict(predict_data)
+
+  score_data , _, _ = reader.prepare_data(FLAGS.score_data,
       FLAGS.vocab_data, FLAGS.vocab_size)
-  model.predict(predict_data)
+  model.force_decode(score_data)
 
 if __name__ == '__main__':
   if FLAGS.output_mode == 'debug' or FLAGS.output_mode == 'verbose':
