@@ -7,12 +7,12 @@ import numpy as np
 import reader
 
 flags = tf.app.flags
-flags.DEFINE_float('learning_rate', 0.1, 'Initial learning rate.')
-flags.DEFINE_float('momentum', 0.8, 'Initial momentum.')
+flags.DEFINE_float('learning_rate', 1.3, 'Initial learning rate.')
+flags.DEFINE_float('momentum', 0.9, 'Initial momentum.')
 flags.DEFINE_float('prob_dropout', 0.5, 'Dropout probability.')
-flags.DEFINE_integer('max_epochs', 50, 'Maximum number of epochs.')
-flags.DEFINE_integer('hidden_dim', 256, 'RNN hidden state size.')
-flags.DEFINE_integer('max_time_steps', 40, 'Truncated backprop length.')
+flags.DEFINE_integer('max_epochs', 10, 'Maximum number of epochs.')
+flags.DEFINE_integer('hidden_dim', 196, 'RNN hidden state size.')
+flags.DEFINE_integer('max_time_steps', 30, 'Truncated backprop length.')
 flags.DEFINE_integer('batch_size', 64, 'Num examples per minibatch.')
 flags.DEFINE_integer('hidden_layers', 2, 'Num of RNN layers.')
 flags.DEFINE_integer('max_grad_norm', 10, 'Clip gradients above this norm.')
@@ -32,6 +32,10 @@ flags.DEFINE_string('checkpoint_prefix',
 flags.DEFINE_string('run_name', 
   'testrun',
   'Run name in tensorboard.')
+flags.DEFINE_integer('valid_freq', 5000, 
+  'Run validation test every this amount of steps.')
+flags.DEFINE_integer('save_freq', 2000, 
+  'Save a model checkpoint every this amount of steps.')
 
 flags.DEFINE_string('output_mode', 'debug', 'verbose|debug|info')
 flags.DEFINE_string('tf_log_dir', '/nfs/topaz/lcheung/tensorboard',
@@ -179,7 +183,7 @@ class RNNLM(object):
           name='loss')
       log.debug('Loss shape; %s' % self.loss.shape)
 
-      self.perplexity = tf.pow(2, self.loss, name='perplexity')
+      self.perplexity = tf.pow(2.0, self.loss, name='perplexity')
 
       tf.summary.scalar("loss_smy", self.loss)
       tf.summary.scalar("perplexity", self.perplexity)
@@ -255,14 +259,9 @@ class RNNLM(object):
             self.state : state,
             self.data_raw : self.dev_data[data_begin : data_end]
           })
-
-      if i % 10000 == 0:
-        log.debug('\n\ttarg: %s\n\tpred: %s' 
-            % (convert_id_tok(target, self.id_tok)[:FLAGS.max_time_steps],
-               convert_id_tok(out, self.id_tok)[:FLAGS.max_time_steps]))
       cum_loss += loss
 
-    log.info('Validation loss: %.3f, num words: %d' 
+    log.info('Cumulative validation loss: %.3f, num words: %d' 
         % (cum_loss, len(self.dev_data)))
 
   def predict(self, data):
@@ -389,16 +388,16 @@ class RNNLM(object):
               })
 
           cum_loss = loss + cum_loss
-          if global_step % 1000 == 0:
+          if global_step % FLAGS.save_freq == 0:
             time_elapsed = timeit.default_timer() - time_begin
             wps = float(words_processed) / time_elapsed 
 
             log.info('Epoch: %d, step: %d, wps: %.2f, loss %s'
                 % (epoch, global_step, wps, cum_loss))
             log.debug('\n\tsrc: %s\n\ttarg: %s\n\tpred: %s' 
-                % (convert_id_tok(source, self.id_tok)[:FLAGS.max_time_steps],
-                   convert_id_tok(target, self.id_tok)[:FLAGS.max_time_steps],
-                   convert_id_tok(out, self.id_tok)[:FLAGS.max_time_steps]))
+                % (convert_id_tok(source, self.id_tok)[:FLAGS.max_time_steps*5],
+                   convert_id_tok(target, self.id_tok)[:FLAGS.max_time_steps*5],
+                   convert_id_tok(out, self.id_tok)[:FLAGS.max_time_steps*5]))
 
             log.debug('Saved model checkpoint to %s.' % FLAGS.checkpoint_prefix)
             self.saver.save(sess, FLAGS.checkpoint_prefix, 
@@ -408,7 +407,7 @@ class RNNLM(object):
             words_processed = 0
             time_begin = timeit.default_timer()
 
-          if global_step % 5000 == 0:
+          if global_step % FLAGS.valid_freq == 0 and global_step != 0:
             self.validate(sess)
 
           file_writer.add_summary(summary_output, 
@@ -437,15 +436,15 @@ def main(_):
   train_data, dev_data, tok_id, id_tok = get_data()
 
   model = RNNLM(train_data, dev_data, id_tok)
-  #model.train()
+  model.train()
 
   #predict_data, _, _ = reader.prepare_data(FLAGS.predict_data,
   #    FLAGS.vocab_data, FLAGS.vocab_size)
   #model.predict(predict_data)
 
-  score_data , _, _ = reader.prepare_data(FLAGS.score_data,
-      FLAGS.vocab_data, FLAGS.vocab_size)
-  model.force_decode(score_data)
+  #score_data , _, _ = reader.prepare_data(FLAGS.score_data,
+  #    FLAGS.vocab_data, FLAGS.vocab_size)
+  #model.force_decode(score_data)
 
 if __name__ == '__main__':
   if FLAGS.output_mode == 'debug' or FLAGS.output_mode == 'verbose':
