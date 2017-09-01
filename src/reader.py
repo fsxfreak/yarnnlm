@@ -166,6 +166,20 @@ def prepare_data(data_filename, vocab_filename, vocab_size=30000):
   data = np.array(vocab_replace_data(raw_data, tok_id))
   return data, tok_id, id_tok
 
+def get_train_data(train_file, dev_file, vocab_file, vocab_size):
+  train_data, tok_id, id_tok  = prepare_data(train_file, vocab_file, vocab_size)
+  dev_data, tok_id, id_tok  = prepare_data(dev_file, vocab_file, vocab_size)
+
+  train_data = squash_data(train_data)
+  dev_data = squash_data(dev_data)
+
+  log.debug('Train data: %s' % train_data[:10])
+  log.info('Length of training data: %d' % len(train_data))
+  log.debug('Dev data: %s' % dev_data[:10])
+  log.info('Length of dev data: %d' % len(dev_data))
+
+  return train_data, dev_data, tok_id, id_tok
+
 def main():
   train_data = read_data('train.txt')
 
@@ -177,4 +191,5 @@ def main():
 if __name__ == '__main__':
   log.getLogger().setLevel(log.DEBUG)
   main()
+
 

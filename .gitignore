@@ -102,3 +102,4 @@ ENV/
 *.pkl
 .*.*.swp
 test.py
+data
