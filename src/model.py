@@ -328,6 +328,65 @@ class RNNLM(object):
       self.coord.join(self.threads)
     return scores
 
+  def find_vectors(self, data):
+    '''
+    Project each sentence in the data to the rnn output vector space.
+    '''
+    log.info('Projecting vectors...')
+
+    vectors = []
+    verbose = self.flags.output_mode == 'verbose'
+    with tf.Session(graph=self.graph,
+                    config=tf.ConfigProto(allow_soft_placement=verbose,
+                    log_device_placement=verbose,
+                    gpu_options=tf.GPUOptions(allow_growth=True))) as sess:
+      self._load(sess)
+
+      for index, line in enumerate(data):
+        state = self.initial_state
+
+        total_length = len(line)
+        num_stages = total_length / self.batch_len
+        remainder = total_length % self.batch_len
+        if remainder != 0:
+          num_stages += 1
+
+        outputs_inter = []
+        for i in range(num_stages):
+          data_begin = i * self.batch_len
+          data_end = data_begin + self.batch_len
+          source = line[data_begin : data_end]
+
+          if remainder != 0 and i == num_stages - 1:
+            # pad with zeros to fill the whole batch
+            source = np.pad(source, 
+                (0, self.batch_len - remainder % self.batch_len), 'constant')
+
+          outputs_raw, state = sess.run(
+              [ self.outputs_squashed, self.next_state ],
+              feed_dict={
+                self.state : state,
+                self.data_raw : source
+                })
+          outputs_inter.append(outputs_raw)
+
+        outputs_inter = np.array(outputs_inter)
+ 
+        # do not take into account vectors for extraneous tokens
+        output = np.reshape(outputs_inter, (-1, self.flags.hidden_dim))
+
+        predict_index = len(line) - 1
+        output = np.mean(outputs_raw, axis=0)
+        vectors.append(output)
+
+        if index % 10000 == 0:
+          log.debug('Projected vector %d.' % index)
+
+      self.coord.request_stop()
+      self.coord.join(self.threads)
+
+    return np.array(vectors)
+
   def train(self):
     verbose = self.flags.output_mode == 'verbose'
     with tf.Session(graph=self.graph,

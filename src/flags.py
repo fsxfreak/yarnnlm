@@ -17,8 +17,6 @@ flags.DEFINE_string('train_data', '../data/train.shuf.txt', 'Training data.')
 flags.DEFINE_string('dev_data', '../data/dev.txt', 'Validation data.')
 flags.DEFINE_string('predict_data', '../data/test.txt',
     'Generate sentences for each seed line of this file.')
-flags.DEFINE_string('score_data', '../data/play.txt',
-    'Generate scores for each line of this file.')
 
 flags.DEFINE_string('checkpoint_prefix', 
   '/nfs/topaz/lcheung/models/tf-test/model',
