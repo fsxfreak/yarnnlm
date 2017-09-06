@@ -4,14 +4,11 @@ import os, sys, timeit
 import tensorflow as tf
 import numpy as np
 
+from util import convert_id_tok
+
 log.basicConfig(stream=sys.stderr, level=log.INFO,
     format='%(asctime)s [%(levelname)s]:%(message)s',  
     datefmt='%Y-%m-%d %H:%M:%S')                        
-
-def convert_id_tok(batches, id_tok):
-  s_raw = [ id_tok[sample] for batch in batches for sample in batch 
-              if sample < len(id_tok)]
-  return ' '.join(s_raw)
 
 class RNNLM(object):
   def __init__(self, flags, train_data, dev_data, id_tok):
@@ -346,12 +343,14 @@ class RNNLM(object):
         state = self.initial_state
 
         total_length = len(line)
+        # account for lines longer than batch_len (related to max_time_steps)
         num_stages = total_length / self.batch_len
         remainder = total_length % self.batch_len
         if remainder != 0:
           num_stages += 1
 
         outputs_inter = []
+        # apply enough batches for the whole input to be processed
         for i in range(num_stages):
           data_begin = i * self.batch_len
           data_end = data_begin + self.batch_len
@@ -372,10 +371,18 @@ class RNNLM(object):
 
         outputs_inter = np.array(outputs_inter)
  
-        # do not take into account vectors for extraneous tokens
+        # squash num_stages together
         output = np.reshape(outputs_inter, (-1, self.flags.hidden_dim))
+        # output.shape: 
+        #   [ FLAGS.batch_size * FLAGS.max_time_steps x FLAGS.hidden_dim]
 
-        predict_index = len(line) - 1
+        # do not take into account vectors for extraneous tokens
+        # does not work - lost the time_steps information
+        #predict_index = len(line) - 1
+        #log.debug('outputs shape: %s' % str(output.shape))
+        #output = output[:predict_index]
+        #log.debug('outputs shape: %s' % str(output.shape))
+
         output = np.mean(outputs_raw, axis=0)
         vectors.append(output)
 
@@ -386,6 +393,42 @@ class RNNLM(object):
       self.coord.join(self.threads)
 
     return np.array(vectors)
+  
+  def find_rare_subs(self, lines, rare_ids):
+    '''
+    sentences: list of lists (representing a list of token lists)
+    rares: list of words 
+
+    return: list of (index, sub) pair where _index_ is the index of the
+            sentence in lines with a rare word substituted in _sub_
+    '''
+    index_subs = []
+
+    verbose = self.flags.output_mode == 'verbose'
+    with tf.Session(graph=self.graph,
+                    config=tf.ConfigProto(allow_soft_placement=verbose,
+                    log_device_placement=verbose,
+                    gpu_options=tf.GPUOptions(allow_growth=True))) as sess:
+      self._load(sess)
+      for index, line in enumerate(data):
+        for predict_index in range(len(line) - 2): # do not process last token
+          state = self.initial_state
+          
+          # condition only up to predict_index words
+          # predicted tokens will be at predict_index of self.token_probs
+          num_stages = predict_index / self.batch_len
+          remainder = predict_index % self.batch_len
+          if remainder != 0:
+            num_stages += 1
+
+          for i in range(num_stages):
+            data_begin = i * self.batch_len
+            data_end = data_begin + self.batch_len
+            source = line[data_begin : data_end]
+
+            source = np.pad(source, 
+                (0, self.batch_len - remainder % self.batch_len), 'constant')
+          # TODO note the top probabilities for rare_ids
 
   def train(self):
     verbose = self.flags.output_mode == 'verbose'
