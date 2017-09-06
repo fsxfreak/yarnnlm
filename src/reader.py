@@ -150,6 +150,10 @@ def load_vocab(vocab_filename, lines=None, max_vocab_size=None):
 def squash_data(data):
   '''
   Squash all sentences together.
+
+  data: list of lists
+  
+  returns: list
   '''
   squashed = np.concatenate(data)
   return squashed
@@ -167,8 +171,11 @@ def prepare_data(data_filename, vocab_filename, vocab_size=30000):
   return data, tok_id, id_tok
 
 def get_train_data(train_file, dev_file, vocab_file, vocab_size):
-  train_data, tok_id, id_tok  = prepare_data(train_file, vocab_file, vocab_size)
-  dev_data, tok_id, id_tok  = prepare_data(dev_file, vocab_file, vocab_size)
+  '''
+  returns train id list, dev id list, token to id dict, id to token dict
+  '''
+  train_data, tok_id, id_tok = prepare_data(train_file, vocab_file, vocab_size)
+  dev_data, tok_id, id_tok = prepare_data(dev_file, vocab_file, vocab_size)
 
   train_data = squash_data(train_data)
   dev_data = squash_data(dev_data)
